@@ -250,6 +250,7 @@ function supportsHdr10(options) {
             || browser.vidaa
             || browser.tizen
             || browser.web0s
+            || browser.xboxOne
             || browser.safari && ((browser.iOS && browser.iOSVersion >= 11) || browser.osx)
             // Chrome mobile and Firefox have no client side tone-mapping
             // Edge Chromium 121+ fixed the tone-mapping color issue on Nvidia
@@ -272,6 +273,7 @@ function supportsDolbyVision(options) {
     // eslint-disable-next-line no-constant-binary-expression, sonarjs/no-redundant-boolean
     return options.supportsDolbyVision ?? (false
             || browser.safari && ((browser.iOS && browser.iOSVersion >= 13) || browser.osx)
+            || browser.xboxOne
     );
 }
 

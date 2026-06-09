@@ -1,0 +1,309 @@
+name: Custom Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      jellyfin_web_ref:
+        description: 'jellyfin-web commit, branch, or tag to build'
+        required: false
+        default: 'master'
+      ssh_host:
+        description: 'Jellyfin server SSH host'
+        required: false
+        default: '10.0.50.25'
+      ssh_user:
+        description: 'Jellyfin server SSH user'
+        required: false
+        default: 'github-runner-deploy'
+      jellyfin_port:
+        description: 'Jellyfin API port'
+        required: false
+        default: '8096'
+      jellyfin_admin_username:
+        description: 'Jellyfin admin username'
+        required: false
+        default: 'datscreamer'
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-deploy:
+    name: Build, deploy web UI, and configure Jellyfin
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out Git repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.jellyfin_web_ref }}
+
+      - name: Setup node environment
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install Node.js dependencies
+        run: npm ci --no-audit
+
+      - name: Run production build
+        env:
+          JELLYFIN_VERSION: ${{ github.event.inputs.jellyfin_web_ref }}
+        run: npm run build:production
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jellyfin-web
+          path: dist
+          if-no-files-found: error
+
+      - name: Setup SSH agent
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.JF_SSH_KEY }}
+
+      - name: Add SSH host key
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H ${{ github.event.inputs.ssh_host }} >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Deploy web UI to Jellyfin server
+        run: |
+          echo "Stopping Jellyfin..."
+          ssh ${{ github.event.inputs.ssh_user }}@${{ github.event.inputs.ssh_host }} "sudo systemctl stop jellyfin"
+          echo "Ensuring web directory exists..."
+          ssh ${{ github.event.inputs.ssh_user }}@${{ github.event.inputs.ssh_host }} "sudo mkdir -p /usr/share/jellyfin/web"
+          echo "Copying web UI files..."
+          rsync -avz --delete dist/ ${{ github.event.inputs.ssh_user }}@${{ github.event.inputs.ssh_host }}:/usr/share/jellyfin/web/
+          echo "Setting ownership and starting Jellyfin..."
+          ssh ${{ github.event.inputs.ssh_user }}@${{ github.event.inputs.ssh_host }} " \
+            sudo chown -R jellyfin:jellyfin /usr/share/jellyfin/web && \
+            sudo systemctl start jellyfin \
+          "
+
+      - name: Wait for Jellyfin API
+        run: |
+          for i in $(seq 1 30); do
+            status=$(curl -s -o /dev/null -w "%{http_code}" "http://${{ github.event.inputs.ssh_host }}:${{ github.event.inputs.jellyfin_port }}/System/Info" 2>/dev/null || echo "000")
+            if [ "$status" = "200" ]; then
+              echo "Jellyfin API is ready"
+              exit 0
+            fi
+            echo "Attempt $i: API returned $status, waiting..."
+            sleep 10
+          done
+          echo "Jellyfin API did not become ready in time"
+          exit 1
+
+      - name: Configure Jellyfin via API
+        env:
+          JF_HOST: ${{ github.event.inputs.ssh_host }}
+          JF_PORT: ${{ github.event.inputs.jellyfin_port }}
+          JF_ADMIN_USERNAME: ${{ github.event.inputs.jellyfin_admin_username }}
+          JF_ADMIN_PASSWORD: ${{ secrets.JF_ADMIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          API_BASE="http://${JF_HOST}:${JF_PORT}"
+          AUTH_BASE='MediaBrowser Client="GitHub Actions", Device="Deploy", DeviceId="gh-deploy", Version="1.0.0"'
+
+          # ------------------------------------------------------------------
+          # Phase 1: Startup wizard (fresh install)
+          # ------------------------------------------------------------------
+          STARTUP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            "${API_BASE}/Startup/Configuration" 2>/dev/null || echo "000")
+
+          if [ "$STARTUP_STATUS" = "200" ]; then
+            echo "Startup wizard is active - completing first-run setup..."
+            curl -s -X GET "${API_BASE}/Startup/User" > /dev/null
+            curl -s -X POST "${API_BASE}/Startup/User" \
+              -H "Content-Type: application/json" \
+              -d "$(jq -n --arg u "${JF_ADMIN_USERNAME}" --arg p "${JF_ADMIN_PASSWORD}" '{Name: $u, Password: $p}')" > /dev/null
+            curl -s -X POST "${API_BASE}/Startup/Complete" > /dev/null
+            echo "Startup wizard completed"
+          fi
+
+          # ------------------------------------------------------------------
+          # Phase 2: Authenticate
+          # ------------------------------------------------------------------
+          AUTH_RESP=$(curl -s -X POST "${API_BASE}/Users/AuthenticateByName" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: ${AUTH_BASE}" \
+            -d "$(jq -n --arg u "${JF_ADMIN_USERNAME}" --arg p "${JF_ADMIN_PASSWORD}" '{Username: $u, Pw: $p}')")
+
+          TOKEN=$(echo "$AUTH_RESP" | jq -r '.AccessToken')
+          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+            echo "Authentication failed. Response: $(echo "$AUTH_RESP" | jq -c .)"
+            exit 1
+          fi
+          echo "Authenticated as ${JF_ADMIN_USERNAME}"
+
+          AUTH_HEADER="${AUTH_BASE}, Token=\"${TOKEN}\""
+
+          # ------------------------------------------------------------------
+          # Phase 3: System configuration
+          # ------------------------------------------------------------------
+          echo "Configuring system settings..."
+          SYS_CONFIG=$(curl -s -X GET "${API_BASE}/System/Configuration" \
+            -H "${AUTH_HEADER}")
+
+          UPDATED_SYS_CONFIG=$(echo "$SYS_CONFIG" | jq '. + {
+            UICulture: "en-CA",
+            MetadataCountryCode: "CA",
+            PreferredMetadataLanguage: "en"
+          }')
+
+          if [ "$SYS_CONFIG" != "$UPDATED_SYS_CONFIG" ]; then
+            curl -s -X POST "${API_BASE}/System/Configuration" \
+              -H "Content-Type: application/json" \
+              -H "${AUTH_HEADER}" \
+              -d "$UPDATED_SYS_CONFIG" > /dev/null
+            echo "System configuration updated"
+          else
+            echo "System configuration already up to date"
+          fi
+
+          # ------------------------------------------------------------------
+          # Phase 4: Encoding / hardware acceleration
+          # ------------------------------------------------------------------
+          echo "Configuring encoding options..."
+          ENCODING_CFG=$(curl -s -X GET "${API_BASE}/System/Configuration/Encoding" \
+            -H "${AUTH_HEADER}")
+
+          UPDATED_ENCODING=$(echo "$ENCODING_CFG" | jq '. + {
+            HardwareAccelerationType: "nvenc",
+            EnableHardwareEncoding: true,
+            EnableEnhancedNvdecDecoder: true,
+            EnableTonemapping: true,
+            HardwareDecodingCodecs: ["h264", "hevc", "mpeg2video", "vc1", "vp8", "vp9", "av1", "hevc10", "vp910"]
+          }')
+
+          if [ "$ENCODING_CFG" != "$UPDATED_ENCODING" ]; then
+            curl -s -X POST "${API_BASE}/System/Configuration/Encoding" \
+              -H "Content-Type: application/json" \
+              -H "${AUTH_HEADER}" \
+              -d "$UPDATED_ENCODING" > /dev/null
+            echo "Encoding configuration updated"
+          else
+            echo "Encoding configuration already up to date"
+          fi
+
+          # ------------------------------------------------------------------
+          # Phase 5: Library management
+          # ------------------------------------------------------------------
+          echo "Managing libraries..."
+
+          EXISTING_VFS=$(curl -s -X GET "${API_BASE}/Library/VirtualFolders" \
+            -H "${AUTH_HEADER}")
+          EXISTING_NAMES=$(echo "$EXISTING_VFS" | jq -r '.[].Name // empty' | sort)
+
+          MEDIA_DIRS=(
+            "/srv/media/Deskstar-8TB"
+            "/srv/media/Deskstar-8TB-2"
+            "/srv/media/Deskstar-8TB-3"
+            "/srv/media/Ironwolf-4TB"
+            "/srv/media/Deskstar-4TB"
+            "/srv/media/Barracuda-1TB"
+          )
+
+          LIBRARIES=("Movies:movies:Movies" "TV Shows:tvshows:TV Shows")
+
+          for lib_def in "${LIBRARIES[@]}"; do
+            IFS=':' read -r lib_name lib_type lib_subdir <<< "$lib_def"
+
+            if echo "$EXISTING_NAMES" | grep -qFx "$lib_name"; then
+              echo "Library '$lib_name' already exists"
+
+              EXISTING_LOCS=$(echo "$EXISTING_VFS" | jq -r --arg n "$lib_name" '.[] | select(.Name == $n) | .Locations[] // empty')
+              for media_dir in "${MEDIA_DIRS[@]}"; do
+                lib_path="${media_dir}/${lib_subdir}"
+                if echo "$EXISTING_LOCS" | grep -qFx "$lib_path"; then
+                  echo "  Already registered: $lib_path"
+                else
+                  echo "  Adding path: $lib_path"
+                  curl -s -X POST "${API_BASE}/Library/VirtualFolders/Paths?refreshLibrary=false" \
+                    -H "Content-Type: application/json" \
+                    -H "${AUTH_HEADER}" \
+                    -d "$(jq -n --arg n "$lib_name" --arg p "$lib_path" '{Name: $n, Path: $p, PathInfo: {Path: $p}}')" > /dev/null
+                fi
+              done
+            else
+              echo "Creating library '$lib_name'..."
+
+              PATHS_JSON="[]"
+              for media_dir in "${MEDIA_DIRS[@]}"; do
+                PATHS_JSON=$(echo "$PATHS_JSON" | jq --arg p "${media_dir}/${lib_subdir}" '. + [{Path: $p}]')
+              done
+
+              LIB_BODY=$(jq -n \
+                --argjson paths "$PATHS_JSON" \
+                '{
+                  LibraryOptions: {
+                    PathInfos: $paths,
+                    PreferredMetadataLanguage: "English",
+                    EnableRealtimeMonitor: false,
+                    EnableChapterImageExtraction: true,
+                    EnableTrickplayImageExtraction: true
+                  }
+                }')
+
+              ENCODED_NAME=$(jq -rn --arg x "$lib_name" '$x|@uri')
+              ENCODED_TYPE=$(jq -rn --arg x "$lib_type" '$x|@uri')
+
+              curl -s -X POST \
+                "${API_BASE}/Library/VirtualFolders?name=${ENCODED_NAME}&collectionType=${ENCODED_TYPE}&refreshLibrary=false" \
+                -H "Content-Type: application/json" \
+                -H "${AUTH_HEADER}" \
+                -d "$LIB_BODY" > /dev/null
+              echo "  Created"
+            fi
+          done
+
+          # ------------------------------------------------------------------
+          # Phase 6: Library options reconciliation
+          # ------------------------------------------------------------------
+          echo "Reconciling library options..."
+          UPDATED_VFS=$(curl -s -X GET "${API_BASE}/Library/VirtualFolders" \
+            -H "${AUTH_HEADER}")
+
+          for lib_def in "${LIBRARIES[@]}"; do
+            IFS=':' read -r lib_name lib_type lib_subdir <<< "$lib_def"
+
+            LIB_ENTRY=$(echo "$UPDATED_VFS" | jq -r --arg n "$lib_name" '.[] | select(.Name == $n) // empty')
+            [ -z "$LIB_ENTRY" ] && continue
+
+            ITEM_ID=$(echo "$LIB_ENTRY" | jq -r '.ItemId // empty')
+            [ -z "$ITEM_ID" ] && continue
+
+            CURRENT_OPTS=$(echo "$LIB_ENTRY" | jq '.LibraryOptions // {}')
+            HAS_CHAPTER=$(echo "$CURRENT_OPTS" | jq '.EnableChapterImageExtraction // false')
+            HAS_TRICKPLAY=$(echo "$CURRENT_OPTS" | jq '.EnableTrickplayImageExtraction // false')
+
+            if [ "$HAS_CHAPTER" = "false" ] || [ "$HAS_TRICKPLAY" = "false" ]; then
+              echo "  Updating '$lib_name'..."
+              MERGED_OPTS=$(echo "$CURRENT_OPTS" | jq '. + {
+                EnableChapterImageExtraction: true,
+                EnableTrickplayImageExtraction: true
+              }')
+
+              curl -s -X POST "${API_BASE}/Library/VirtualFolders/LibraryOptions" \
+                -H "Content-Type: application/json" \
+                -H "${AUTH_HEADER}" \
+                -d "$(jq -n --arg id "$ITEM_ID" --argjson opts "$MERGED_OPTS" '{Id: $id, LibraryOptions: $opts}')" > /dev/null
+              echo "  Updated"
+            else
+              echo "  Already up to date: '$lib_name'"
+            fi
+          done
+
+          # ------------------------------------------------------------------
+          # Phase 7: Refresh library
+          # ------------------------------------------------------------------
+          echo "Triggering library refresh..."
+          curl -s -X POST "${API_BASE}/Library/Refresh" \
+            -H "${AUTH_HEADER}" > /dev/null
+          echo "Library refresh triggered"
+
+          echo ""
+          echo "Jellyfin configuration complete"
