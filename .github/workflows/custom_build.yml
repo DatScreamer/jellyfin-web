@@ -1,0 +1,56 @@
+name: Trigger packaging build (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      jellyfin_web_ref:
+        description: 'jellyfin-web commit, branch, or tag to build'
+        required: false
+        default: 'master'
+      jellyfin_release_ref:
+        description: 'jellyfin server release ref'
+        required: false
+        default: 'master'
+      debian_release:
+        description: 'Debian release codename'
+        required: false
+        default: 'trixie'
+      architecture:
+        description: 'Package architecture'
+        required: false
+        default: 'amd64'
+
+permissions:
+  contents: read
+
+jobs:
+  trigger:
+    name: Trigger jellyfin-packaging build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Generate GitHub App token
+        uses: actions/create-github-app-token@v1
+        id: app-token
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Trigger packaging workflow
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            await github.rest.actions.createWorkflowDispatch({
+              owner: '${{ github.repository_owner }}',
+              repo: 'jellyfin-packaging',
+              workflow_id: 'custom_build.yml',
+              ref: 'master',
+              inputs: {
+                jellyfin_version: 'auto',
+                jellyfin_release_ref: '${{ github.event.inputs.jellyfin_release_ref || 'master' }}',
+                jellyfin_web_ref: '${{ github.event.inputs.jellyfin_web_ref || 'master' }}',
+                debian_release: '${{ github.event.inputs.debian_release || 'trixie' }}',
+                architecture: '${{ github.event.inputs.architecture || 'amd64' }}'
+              }
+            })
