@@ -245,12 +245,15 @@ function supportsVc1(videoTestElement) {
 }
 
 function supportsHdr10(options) {
+    // Xbox: trust the browser detection over the native shell, which can
+    // return false from HdmiDisplayInformation during HDMI handshake.
+    if (browser.xboxOne) return true;
+
     // eslint-disable-next-line no-constant-binary-expression, sonarjs/no-redundant-boolean
     return options.supportsHdr10 ?? (false
             || browser.vidaa
             || browser.tizen
             || browser.web0s
-            || browser.xboxOne
             || browser.safari && ((browser.iOS && browser.iOSVersion >= 11) || browser.osx)
             // Chrome mobile and Firefox have no client side tone-mapping
             // Edge Chromium 121+ fixed the tone-mapping color issue on Nvidia
@@ -270,10 +273,12 @@ function supportsHlg(options) {
 }
 
 function supportsDolbyVision(options) {
+    // Xbox: trust the browser detection over the native shell
+    if (browser.xboxOne) return true;
+
     // eslint-disable-next-line no-constant-binary-expression, sonarjs/no-redundant-boolean
     return options.supportsDolbyVision ?? (false
             || browser.safari && ((browser.iOS && browser.iOSVersion >= 13) || browser.osx)
-            || browser.xboxOne
     );
 }
 
