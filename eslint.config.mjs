@@ -59,7 +59,6 @@ export default tseslint.config(
             'new-cap': [
                 'error',
                 {
-                    'capIsNewExceptions': ['jQuery.Deferred'],
                     'newIsCapExceptionPattern': String.raw`\.default$`
                 }
             ],
@@ -258,8 +257,6 @@ export default tseslint.config(
                 'Response.json',
                 // document-register-element
                 'document.registerElement',
-                // resize-observer-polyfill
-                'ResizeObserver',
                 // fast-text-encoding
                 'TextEncoder',
                 // intersection-observer
